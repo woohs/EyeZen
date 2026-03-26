@@ -9,22 +9,38 @@ import sys
 import time
 import ctypes
 
-from PySide6.QtCore import Qt, QTimer, Signal, QSize, QRect
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QRect, QRectF, QPointF
 from PySide6.QtGui import (
     QAction, QIcon, QPainter, QColor, QPixmap, QScreen,
-    QLinearGradient, QPainterPath
+    QLinearGradient, QPainterPath, QPen
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QStackedWidget, QFrame,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
-    QSystemTrayIcon, QMenu, QGridLayout, QScrollArea
+    QSystemTrayIcon, QMenu, QGridLayout, QScrollArea, QSizePolicy
 )
 
 from stats_store import StatsStore, format_duration
 
 INTERVAL_MS = 30 * 60 * 1000
 DAILY_BREAK_GOAL = 8
+
+
+def format_percent(value: float) -> str:
+    percent = max(0.0, min(1.0, float(value))) * 100
+    return f"{percent:.0f}%"
+
+
+def format_duration_compact(sec: int) -> str:
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec} 秒"
+    minutes = sec // 60
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours, remain_minutes = divmod(minutes, 60)
+    return f"{hours}时{remain_minutes}分"
 
 
 def _enable_windows_dpi_awareness() -> None:
@@ -187,71 +203,239 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 }
 """
 
-class TrendChartWidget(QWidget):
-    """自定义图表：绘制最近7周的休息次数柱状图"""
+class GoalRingWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.data = []
-        self.setMinimumHeight(150)
+        self.progress = 0.0
+        self.current_value = 0
+        self.goal_value = DAILY_BREAK_GOAL
+        self.setMinimumSize(180, 180)
 
-    def set_data(self, data):
-        self.data = data
+    def set_progress(self, progress: float, current_value: int, goal_value: int):
+        self.progress = max(0.0, min(1.0, float(progress)))
+        self.current_value = max(0, int(current_value))
+        self.goal_value = max(0, int(goal_value))
         self.update()
 
     def paintEvent(self, event):
-        if not self.data:
-            return
-
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
+        side = min(self.width(), self.height()) - 20
+        rect = QRectF((self.width() - side) / 2, (self.height() - side) / 2, side, side)
+
+        track_pen = QPen(QColor("#E9EEF5"), 14)
+        track_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(track_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawArc(rect, 0, 360 * 16)
+
+        progress_pen = QPen(QColor("#0078D4"), 14)
+        progress_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(progress_pen)
+        painter.drawArc(rect, 90 * 16, int(-360 * 16 * self.progress))
+
+        painter.setPen(QColor("#111111"))
+        value_font = painter.font()
+        value_font.setPointSize(26)
+        value_font.setBold(True)
+        painter.setFont(value_font)
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, format_percent(self.progress))
+
+        sub_rect = self.rect().adjusted(0, 44, 0, 0)
+        painter.setPen(QColor("#6B7280"))
+        sub_font = painter.font()
+        sub_font.setPointSize(10)
+        painter.setFont(sub_font)
+        painter.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter, f"{self.current_value} / {self.goal_value} 次")
+
+
+class RateTrendChartWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.data = []
+        self.setMinimumHeight(210)
+
+    def set_data(self, data):
+        self.data = data or []
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if not self.data:
+            painter.setPen(QColor("#9CA3AF"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "暂无达成率数据")
+            return
+
         w = self.width()
         h = self.height()
-        margin_bottom = 24
-        margin_top = 24
-        chart_h = h - margin_bottom - margin_top
+        left = 36
+        right = 18
+        top = 20
+        bottom = 34
+        chart_w = max(1, w - left - right)
+        chart_h = max(1, h - top - bottom)
 
-        counts = [d.get("count", 0) for d in self.data]
-        max_c = max(max(counts) if counts else 0, 5)
+        painter.setPen(QPen(QColor("#E5E7EB"), 1))
+        for step in range(5):
+            y = top + chart_h * step / 4
+            painter.drawLine(left, int(y), left + chart_w, int(y))
 
-        num_bars = len(self.data)
-        bar_width = min(36, w // (num_bars * 2))
-        spacing = (w - (bar_width * num_bars)) // (num_bars + 1)
+        points = []
+        count = len(self.data)
+        for index, item in enumerate(self.data):
+            x = left if count == 1 else left + chart_w * index / (count - 1)
+            rate = max(0.0, min(1.0, float(item.get("rate", 0.0))))
+            y = top + chart_h * (1 - rate)
+            points.append(QPointF(x, y))
+
+        area_path = QPainterPath()
+        area_path.moveTo(points[0].x(), top + chart_h)
+        for point in points:
+            area_path.lineTo(point)
+        area_path.lineTo(points[-1].x(), top + chart_h)
+        area_path.closeSubpath()
+        area_gradient = QLinearGradient(0, top, 0, top + chart_h)
+        area_gradient.setColorAt(0.0, QColor(0, 120, 212, 70))
+        area_gradient.setColorAt(1.0, QColor(0, 120, 212, 10))
+        painter.fillPath(area_path, area_gradient)
+
+        line_pen = QPen(QColor("#0078D4"), 3)
+        line_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        line_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(line_pen)
+        for idx in range(len(points) - 1):
+            painter.drawLine(points[idx], points[idx + 1])
+
+        for idx, point in enumerate(points):
+            painter.setBrush(QColor("#FFFFFF"))
+            painter.setPen(QPen(QColor("#0078D4"), 2))
+            painter.drawEllipse(point, 4, 4)
+            painter.setPen(QColor("#6B7280"))
+            painter.drawText(QRectF(point.x() - 22, point.y() - 28, 44, 18), Qt.AlignmentFlag.AlignCenter, format_percent(self.data[idx].get("rate", 0.0)))
+            painter.drawText(QRectF(point.x() - 28, top + chart_h + 8, 56, 18), Qt.AlignmentFlag.AlignCenter, str(self.data[idx].get("date", "")))
+
+
+class DurationDistributionWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.data = []
+        self.setMinimumHeight(190)
+
+    def set_data(self, data):
+        self.data = data or []
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if not self.data:
+            painter.setPen(QColor("#9CA3AF"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "暂无休息时长分布")
+            return
+
+        total = sum(max(0, int(item.get("duration_sec", 0))) for item in self.data)
+        colors = {
+            "上午": QColor("#0EA5E9"),
+            "下午": QColor("#10B981"),
+            "晚上": QColor("#F59E0B"),
+        }
+        labels_rect = QRect(0, self.height() - 62, self.width(), 56)
+        bar_rect = QRectF(12, 30, max(40, self.width() - 24), 44)
 
         painter.setPen(Qt.PenStyle.NoPen)
-        for i, d in enumerate(self.data):
-            c = d.get("count", 0)
-            bar_h = (c / max_c) * chart_h
-            
-            x = spacing + i * (bar_width + spacing)
-            y = int(margin_top + chart_h - bar_h)
+        painter.setBrush(QColor("#EEF2F7"))
+        painter.drawRoundedRect(bar_rect, 14, 14)
 
-            # 柱子渐变色
-            bar_gradient = QLinearGradient(x, y, x, y + bar_h)
-            bar_gradient.setColorAt(0.0, QColor("#3AA2F5"))
-            bar_gradient.setColorAt(1.0, QColor("#1061C1"))
+        start_x = bar_rect.x()
+        for item in self.data:
+            duration_sec = max(0, int(item.get("duration_sec", 0)))
+            if total == 0:
+                width = bar_rect.width() / max(1, len(self.data))
+            else:
+                width = bar_rect.width() * duration_sec / total
+            rect = QRectF(start_x, bar_rect.y(), width, bar_rect.height())
+            painter.setBrush(colors.get(str(item.get("period", "")), QColor("#94A3B8")))
+            painter.drawRoundedRect(rect, 14, 14)
+            start_x += width
 
-            painter.setBrush(bar_gradient)
-            painter.drawRoundedRect(x, y, bar_width, int(bar_h), 4, 4)
+        item_width = self.width() / max(1, len(self.data))
+        for index, item in enumerate(self.data):
+            period = str(item.get("period", ""))
+            duration_sec = max(0, int(item.get("duration_sec", 0)))
+            text_rect = QRectF(index * item_width, labels_rect.top(), item_width, labels_rect.height())
+            painter.setBrush(colors.get(period, QColor("#94A3B8")))
+            painter.drawEllipse(QRectF(text_rect.x() + 12, text_rect.y() + 12, 10, 10))
+            painter.setPen(QColor("#374151"))
+            title_rect = QRectF(text_rect.x() + 28, text_rect.y() + 4, item_width - 30, 20)
+            painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, period)
+            painter.setPen(QColor("#6B7280"))
+            painter.drawText(QRectF(text_rect.x() + 28, text_rect.y() + 24, item_width - 30, 20), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, format_duration_compact(duration_sec))
 
-            # 数值标签
-            if c > 0:
-                painter.setPen(QColor("#555555"))
-                val_font = painter.font()
-                val_font.setBold(True)
-                painter.setFont(val_font)
-                painter.drawText(QRect(x - 10, y - 20, bar_width + 20, 20), Qt.AlignmentFlag.AlignCenter, str(c))
 
-            # X轴日期标签
-            painter.setPen(QColor("#888888"))
-            date_font = painter.font()
-            date_font.setBold(False)
-            date_font.setPointSize(9)
-            painter.setFont(date_font)
-            painter.drawText(QRect(x - 20, h - margin_bottom + 4, bar_width + 40, 20), Qt.AlignmentFlag.AlignCenter, d.get("date", ""))
-            painter.setPen(Qt.PenStyle.NoPen)
-            
-        painter.end()
+class HeatmapWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.data = []
+        self.setMinimumHeight(260)
+
+    def set_data(self, data):
+        self.data = data or []
+        self.update()
+
+    def _cell_color(self, count: int) -> QColor:
+        if count <= 0:
+            return QColor("#F3F4F6")
+        if count == 1:
+            return QColor("#D7ECFF")
+        if count == 2:
+            return QColor("#9FD4FF")
+        return QColor("#3AA2F5")
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if not self.data:
+            painter.setPen(QColor("#9CA3AF"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "暂无热力图数据")
+            return
+
+        periods = ["上午", "下午", "晚上"]
+        top = 34
+        left = 54
+        right = 16
+        bottom = 18
+        rows = len(self.data)
+        cols = len(periods)
+        cell_w = max(48, (self.width() - left - right) / max(1, cols))
+        cell_h = max(24, (self.height() - top - bottom) / max(1, rows))
+
+        painter.setPen(QColor("#6B7280"))
+        for col, period in enumerate(periods):
+            rect = QRectF(left + col * cell_w, 4, cell_w, 24)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, period)
+
+        for row_index, row in enumerate(self.data):
+            date_label = str(row.get("date", ""))
+            painter.drawText(QRectF(0, top + row_index * cell_h, left - 8, cell_h), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, date_label)
+            hours = row.get("hours", [])
+            hour_map = {str(item.get("period", "")): item for item in hours if isinstance(item, dict)}
+            for col, period in enumerate(periods):
+                item = hour_map.get(period, {})
+                count = max(0, int(item.get("count", 0)))
+                duration_text = format_duration_compact(int(item.get("duration_sec", 0)))
+                rect = QRectF(left + col * cell_w + 4, top + row_index * cell_h + 4, cell_w - 8, cell_h - 8)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(self._cell_color(count))
+                painter.drawRoundedRect(rect, 8, 8)
+                painter.setPen(QColor("#0F172A") if count >= 2 else QColor("#475569"))
+                painter.drawText(rect.adjusted(0, -8, 0, 0), Qt.AlignmentFlag.AlignCenter, f"{count} 次")
+                painter.setPen(QColor("#64748B"))
+                painter.drawText(rect.adjusted(0, 10, 0, 0), Qt.AlignmentFlag.AlignCenter, duration_text)
 
 
 class ToggleSwitch(QPushButton):
@@ -343,7 +527,8 @@ class EyeRestApp(QMainWindow):
         _enable_windows_dpi_awareness()
         self.stats = StatsStore.load()
         self.setWindowTitle("瞳憩")
-        self.resize(860, 600)
+        self.resize(1360, 900)
+        self.setMinimumSize(1180, 780)
         self.setWindowIcon(_create_tray_icon())
         self.setStyleSheet(MAIN_QSS)
         
@@ -507,6 +692,7 @@ class EyeRestApp(QMainWindow):
         scroll.setWidgetResizable(True)
         
         page = QWidget()
+        page.setMinimumWidth(1220)
         scroll.setWidget(page)
         
         layout = QVBoxLayout(page)
@@ -528,9 +714,14 @@ class EyeRestApp(QMainWindow):
         
         # Grid Card: KPI Stats
         grid_card = CardWidget()
+        grid_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         grid = QGridLayout(grid_card)
         grid.setContentsMargins(24, 24, 24, 24)
-        grid.setSpacing(30)
+        grid.setHorizontalSpacing(36)
+        grid.setVerticalSpacing(28)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
         
         self.stat_labels = {}
         def add_stat_box(title_text, key, row, col):
@@ -556,48 +747,165 @@ class EyeRestApp(QMainWindow):
         add_stat_box("近 7 天时长", "week_dur", 1, 2)
         layout.addWidget(grid_card)
 
-        hw_layout = QHBoxLayout()
-        hw_layout.setSpacing(20)
-        
-        # Left half: Today's Goal
+        health_title = QLabel("核心健康指标")
+        health_title.setStyleSheet("font-size: 18px; font-weight: 800; color: #111827; margin-top: 6px;")
+        layout.addWidget(health_title)
+
+        health_layout = QHBoxLayout()
+        health_layout.setSpacing(20)
+
         goal_card = CardWidget()
+        goal_card.setMinimumHeight(330)
         gl = QVBoxLayout(goal_card)
-        gl.setContentsMargins(20, 24, 20, 24)
-        gl.setSpacing(12)
-        
-        gh = QHBoxLayout()
-        gl_title = QLabel(f"今日健康目标 ({DAILY_BREAK_GOAL}次)")
-        gl_title.setStyleSheet("font-weight: bold; font-size: 15px;")
-        gh.addWidget(gl_title)
-        
-        self.goal_hint_label = QLabel()
-        self.goal_hint_label.setStyleSheet("color: #888; font-size: 13px;")
-        gh.addStretch()
-        gh.addWidget(self.goal_hint_label)
-        gl.addLayout(gh)
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximum(DAILY_BREAK_GOAL)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        gl.addWidget(self.progress_bar)
-        
-        hw_layout.addWidget(goal_card, 1)
-        
-        # Right half: Trend Chart
+        gl.setContentsMargins(22, 22, 22, 22)
+        gl.setSpacing(14)
+
+        goal_title = QLabel("今日护眼达成率")
+        goal_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #0F172A;")
+        gl.addWidget(goal_title)
+
+        goal_subtitle = QLabel(f"以每日 {DAILY_BREAK_GOAL} 次有效休息为目标")
+        goal_subtitle.setStyleSheet("font-size: 13px; color: #6B7280;")
+        gl.addWidget(goal_subtitle)
+
+        self.goal_ring = GoalRingWidget()
+        gl.addWidget(self.goal_ring, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self.goal_hint_label = QLabel("—")
+        self.goal_hint_label.setStyleSheet("font-size: 13px; color: #475569; font-weight: 600;")
+        self.goal_hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        gl.addWidget(self.goal_hint_label)
+
+        health_layout.addWidget(goal_card, 1)
+
+        weekly_card = CardWidget()
+        weekly_card.setMinimumHeight(330)
+        wl = QVBoxLayout(weekly_card)
+        wl.setContentsMargins(22, 22, 22, 22)
+        wl.setSpacing(12)
+
+        week_title = QLabel("本周护眼达成率")
+        week_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #0F172A;")
+        wl.addWidget(week_title)
+
+        self.week_goal_value_label = QLabel("—")
+        self.week_goal_value_label.setStyleSheet("font-size: 30px; font-weight: 800; color: #0078D4;")
+        wl.addWidget(self.week_goal_value_label)
+
+        self.week_goal_hint_label = QLabel("—")
+        self.week_goal_hint_label.setStyleSheet("font-size: 13px; color: #6B7280;")
+        wl.addWidget(self.week_goal_hint_label)
+
+        self.week_progress_bar = QProgressBar()
+        self.week_progress_bar.setMaximum(100)
+        self.week_progress_bar.setValue(0)
+        self.week_progress_bar.setTextVisible(False)
+        wl.addWidget(self.week_progress_bar)
+        wl.addStretch()
+
+        health_layout.addWidget(weekly_card, 1)
+        layout.addLayout(health_layout)
+
+        trend_grid = QGridLayout()
+        trend_grid.setHorizontalSpacing(20)
+        trend_grid.setVerticalSpacing(20)
+        trend_grid.setColumnStretch(0, 3)
+        trend_grid.setColumnStretch(1, 2)
+
         trend_card = CardWidget()
+        trend_card.setMinimumHeight(340)
         tl = QVBoxLayout(trend_card)
-        tl.setContentsMargins(20, 16, 20, 16)
-        
-        tl_title = QLabel("近七天规律概览")
-        tl_title.setStyleSheet("font-weight: bold; font-size: 14px; color: #555;")
+        tl.setContentsMargins(20, 18, 20, 18)
+        tl.setSpacing(10)
+
+        tl_title = QLabel("近 7 天每日达成率趋势")
+        tl_title.setStyleSheet("font-weight: 700; font-size: 15px; color: #0F172A;")
         tl.addWidget(tl_title)
-        
-        self.trend_chart = TrendChartWidget()
-        tl.addWidget(self.trend_chart)
-        
-        hw_layout.addWidget(trend_card, 2)
-        layout.addLayout(hw_layout)
+
+        tl_desc = QLabel("折线展示每天有效休息完成度变化")
+        tl_desc.setStyleSheet("font-size: 12px; color: #6B7280;")
+        tl.addWidget(tl_desc)
+
+        self.rate_trend_chart = RateTrendChartWidget()
+        tl.addWidget(self.rate_trend_chart)
+
+        trend_grid.addWidget(trend_card, 0, 0)
+
+        summary_card = CardWidget()
+        summary_card.setMinimumHeight(340)
+        sl = QVBoxLayout(summary_card)
+        sl.setContentsMargins(20, 20, 20, 20)
+        sl.setSpacing(12)
+
+        summary_title = QLabel("本周概况")
+        summary_title.setStyleSheet("font-weight: 700; font-size: 15px; color: #0F172A;")
+        sl.addWidget(summary_title)
+
+        self.week_count_summary = QLabel("—")
+        self.week_count_summary.setStyleSheet("font-size: 24px; font-weight: 800; color: #111827;")
+        sl.addWidget(self.week_count_summary)
+
+        self.week_duration_summary = QLabel("—")
+        self.week_duration_summary.setStyleSheet("font-size: 14px; color: #475569;")
+        sl.addWidget(self.week_duration_summary)
+
+        summary_note = QLabel("说明：少于 1 分钟的短休会保留时长记录，但不计入休息次数。")
+        summary_note.setWordWrap(True)
+        summary_note.setStyleSheet("font-size: 12px; color: #6B7280; line-height: 1.4;")
+        sl.addWidget(summary_note)
+        sl.addStretch()
+
+        trend_grid.addWidget(summary_card, 0, 1)
+        layout.addLayout(trend_grid)
+
+        distribution_title = QLabel("休息时长分布")
+        distribution_title.setStyleSheet("font-size: 18px; font-weight: 800; color: #111827; margin-top: 4px;")
+        layout.addWidget(distribution_title)
+
+        distribution_grid = QGridLayout()
+        distribution_grid.setHorizontalSpacing(20)
+        distribution_grid.setVerticalSpacing(20)
+        distribution_grid.setColumnStretch(0, 3)
+        distribution_grid.setColumnStretch(1, 4)
+
+        dist_card = CardWidget()
+        dist_card.setMinimumHeight(320)
+        dl = QVBoxLayout(dist_card)
+        dl.setContentsMargins(20, 18, 20, 18)
+        dl.setSpacing(8)
+
+        dist_title = QLabel("时段累积休息时长")
+        dist_title.setStyleSheet("font-weight: 700; font-size: 15px; color: #0F172A;")
+        dl.addWidget(dist_title)
+
+        dist_desc = QLabel("堆叠柱状图按上午 / 下午 / 晚上统计近 7 天累积休息时长")
+        dist_desc.setStyleSheet("font-size: 12px; color: #6B7280;")
+        dl.addWidget(dist_desc)
+
+        self.duration_distribution_chart = DurationDistributionWidget()
+        dl.addWidget(self.duration_distribution_chart)
+
+        distribution_grid.addWidget(dist_card, 0, 0)
+
+        heatmap_card = CardWidget()
+        heatmap_card.setMinimumHeight(320)
+        hl = QVBoxLayout(heatmap_card)
+        hl.setContentsMargins(20, 18, 20, 18)
+        hl.setSpacing(8)
+
+        heatmap_title = QLabel("一周时段休息热力图")
+        heatmap_title.setStyleSheet("font-weight: 700; font-size: 15px; color: #0F172A;")
+        hl.addWidget(heatmap_title)
+
+        heatmap_desc = QLabel("颜色越深表示该日期时段内的有效休息越频繁")
+        heatmap_desc.setStyleSheet("font-size: 12px; color: #6B7280;")
+        hl.addWidget(heatmap_desc)
+
+        self.heatmap_chart = HeatmapWidget()
+        hl.addWidget(self.heatmap_chart)
+
+        distribution_grid.addWidget(heatmap_card, 0, 1)
+        layout.addLayout(distribution_grid)
         
         # Table of recents
         rl = QLabel("近期记录明细")
@@ -612,7 +920,9 @@ class EyeRestApp(QMainWindow):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.table.setMinimumHeight(150)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.setAlternatingRowColors(True)
+        self.table.setMinimumHeight(280)
         layout.addWidget(self.table)
         
         layout.addStretch()
@@ -691,7 +1001,7 @@ class EyeRestApp(QMainWindow):
 
     def _refresh_stats(self):
         self.stats.reload()
-        s = self.stats.summary()
+        s = self.stats.summary(DAILY_BREAK_GOAL)
         
         self.stat_labels["total_breaks"].setText(f"{s['total_breaks']} 次")
         self.stat_labels["total_dur"].setText(format_duration(s['total_duration_sec']))
@@ -700,20 +1010,29 @@ class EyeRestApp(QMainWindow):
         self.stat_labels["week_count"].setText(f"{s['week_count']} 次")
         self.stat_labels["week_dur"].setText(format_duration(s['week_duration_sec']))
         
-        today_n = min(DAILY_BREAK_GOAL, max(0, s['today_count']))
-        self.progress_bar.setValue(today_n)
-        
-        hint = f"进度：{s['today_count']} / {DAILY_BREAK_GOAL}"
+        today_rate = float(s.get("today_goal_rate", 0.0))
+        week_rate = float(s.get("week_goal_rate", 0.0))
+        self.goal_ring.set_progress(today_rate, s['today_count'], DAILY_BREAK_GOAL)
+
+        hint = f"今日有效休息 {s['today_count']} 次，达成率 {format_percent(today_rate)}"
         if s['today_count'] >= DAILY_BREAK_GOAL:
-            hint += " (已达标！)"
-            self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #34C759; border-radius: 4px; }")
-        else:
-            self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #0078D4; border-radius: 4px; }")
+            hint += "，已完成今日目标"
         self.goal_hint_label.setText(hint)
-        
-        # 刷新趋势图表
-        week_trend = s.get("week_trend", [])
-        self.trend_chart.set_data(week_trend)
+
+        self.week_goal_value_label.setText(format_percent(week_rate))
+        self.week_goal_hint_label.setText(f"近 7 天累计 {s['week_count']} 次有效休息，目标 {DAILY_BREAK_GOAL * 7} 次")
+        self.week_progress_bar.setValue(int(round(week_rate * 100)))
+        if week_rate >= 1.0:
+            self.week_progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #34C759; border-radius: 4px; }")
+        else:
+            self.week_progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #0078D4; border-radius: 4px; }")
+
+        self.week_count_summary.setText(f"近 7 天共 {s['week_count']} 次有效休息")
+        self.week_duration_summary.setText(f"累计休息时长 {format_duration(s['week_duration_sec'])}")
+
+        self.rate_trend_chart.set_data(s.get("week_rate_trend", []))
+        self.duration_distribution_chart.set_data(s.get("period_duration_distribution", []))
+        self.heatmap_chart.set_data(s.get("week_heatmap", []))
         
         # 刷新表格
         recent = s.get("recent", [])[:20]
