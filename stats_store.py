@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,8 @@ from typing import Any
 MIN_COUNTED_BREAK_SEC = 60
 DEFAULT_DAILY_BREAK_GOAL = 8
 PERIOD_LABELS = ("上午", "下午", "晚上")
+DEFAULT_WORKDAY_START_MINUTES = 9 * 60
+DEFAULT_WORKDAY_END_MINUTES = 18 * 60
 
 
 def _empty_periods() -> dict[str, int]:
@@ -47,6 +49,74 @@ def _coerce_event(entry: Any) -> dict[str, Any] | None:
         "counted": duration_sec >= MIN_COUNTED_BREAK_SEC,
         "period": _period_for_hour(ended_at.hour),
     }
+
+
+def _format_clock_minutes(total_minutes: int) -> str:
+    normalized = int(total_minutes) % (24 * 60)
+    hour, minute = divmod(normalized, 60)
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _parse_clock_minutes(value: Any, fallback: int) -> int:
+    if isinstance(value, str):
+        parts = value.split(":")
+        if len(parts) == 2 and all(part.isdigit() for part in parts):
+            hour = int(parts[0])
+            minute = int(parts[1])
+            if 0 <= hour < 24 and 0 <= minute < 60:
+                return hour * 60 + minute
+    return fallback
+
+
+@dataclass(frozen=True)
+class ReminderSettings:
+    workday_start_minutes: int = DEFAULT_WORKDAY_START_MINUTES
+    workday_end_minutes: int = DEFAULT_WORKDAY_END_MINUTES
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ReminderSettings:
+        payload = data if isinstance(data, dict) else {}
+        return cls(
+            workday_start_minutes=_parse_clock_minutes(
+                payload.get("workday_start"),
+                DEFAULT_WORKDAY_START_MINUTES,
+            ),
+            workday_end_minutes=_parse_clock_minutes(
+                payload.get("workday_end"),
+                DEFAULT_WORKDAY_END_MINUTES,
+            ),
+        )
+
+    @property
+    def workday_start(self) -> str:
+        return _format_clock_minutes(self.workday_start_minutes)
+
+    @property
+    def workday_end(self) -> str:
+        return _format_clock_minutes(self.workday_end_minutes)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "workday_start": self.workday_start,
+            "workday_end": self.workday_end,
+        }
+
+    def contains(self, current_time: datetime | dt_time | None = None) -> bool:
+        if current_time is None:
+            now = datetime.now().time()
+        elif isinstance(current_time, datetime):
+            now = current_time.time()
+        else:
+            now = current_time
+
+        minutes = now.hour * 60 + now.minute
+        start = self.workday_start_minutes
+        end = self.workday_end_minutes
+        if start == end:
+            return True
+        if start < end:
+            return start <= minutes < end
+        return minutes >= start or minutes < end
 
 
 def default_data_dir() -> Path:
@@ -85,6 +155,8 @@ class StatsStore:
                 "history": [],
             }
         data.setdefault("history", [])
+        settings = ReminderSettings.from_dict(data.get("reminder_settings"))
+        data["reminder_settings"] = settings.to_dict()
         return cls(path=path, data=data)
 
     def reload(self) -> None:
@@ -122,6 +194,17 @@ class StatsStore:
         history.insert(0, event)
         self.data["history"] = history[:365]
         self._save()
+
+    def reminder_settings(self) -> ReminderSettings:
+        settings = ReminderSettings.from_dict(self.data.get("reminder_settings"))
+        self.data["reminder_settings"] = settings.to_dict()
+        return settings
+
+    def update_reminder_settings(self, settings: ReminderSettings) -> ReminderSettings:
+        normalized = ReminderSettings.from_dict(settings.to_dict())
+        self.data["reminder_settings"] = normalized.to_dict()
+        self._save()
+        return normalized
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

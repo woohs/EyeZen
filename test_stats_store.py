@@ -1,8 +1,9 @@
 import tempfile
 import unittest
+from datetime import time as dt_time
 from pathlib import Path
 
-from stats_store import StatsStore
+from stats_store import ReminderSettings, StatsStore
 
 
 class StatsStoreTests(unittest.TestCase):
@@ -48,6 +49,48 @@ class StatsStoreTests(unittest.TestCase):
         self.assertEqual(len(summary["period_duration_distribution"]), 3)
         self.assertEqual(len(summary["week_heatmap"]), 7)
         self.assertEqual(len(summary["week_heatmap"][0]["hours"]), 3)
+
+    def test_default_reminder_settings_are_available(self):
+        settings = self.store.reminder_settings()
+
+        self.assertEqual(settings.workday_start, "09:00")
+        self.assertEqual(settings.workday_end, "18:00")
+        self.assertEqual(
+            self.store.data["reminder_settings"],
+            {"workday_start": "09:00", "workday_end": "18:00"},
+        )
+
+    def test_update_reminder_settings_is_persisted(self):
+        settings = ReminderSettings.from_dict(
+            {"workday_start": "08:30", "workday_end": "17:45"}
+        )
+
+        self.store.update_reminder_settings(settings)
+
+        reloaded = StatsStore(path=self.store.path, data={})
+        reloaded.reload()
+        saved = reloaded.reminder_settings()
+        self.assertEqual(saved.workday_start, "08:30")
+        self.assertEqual(saved.workday_end, "17:45")
+
+    def test_reminder_settings_contains_only_work_hours(self):
+        settings = ReminderSettings.from_dict(
+            {"workday_start": "09:00", "workday_end": "18:00"}
+        )
+
+        self.assertTrue(settings.contains(dt_time(9, 0)))
+        self.assertTrue(settings.contains(dt_time(12, 30)))
+        self.assertFalse(settings.contains(dt_time(8, 59)))
+        self.assertFalse(settings.contains(dt_time(18, 0)))
+
+    def test_reminder_settings_supports_overnight_windows(self):
+        settings = ReminderSettings.from_dict(
+            {"workday_start": "22:00", "workday_end": "06:00"}
+        )
+
+        self.assertTrue(settings.contains(dt_time(22, 0)))
+        self.assertTrue(settings.contains(dt_time(1, 15)))
+        self.assertFalse(settings.contains(dt_time(12, 0)))
 
 
 if __name__ == "__main__":

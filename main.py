@@ -8,8 +8,9 @@ from __future__ import annotations
 import sys
 import time
 import ctypes
+from math import ceil
 
-from PySide6.QtCore import Qt, QTimer, Signal, QSize, QRect, QRectF, QPointF
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QRect, QRectF, QPointF, QTime
 from PySide6.QtGui import (
     QAction, QIcon, QPainter, QColor, QPixmap, QScreen,
     QLinearGradient, QPainterPath, QPen
@@ -18,10 +19,11 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QStackedWidget, QFrame,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
-    QSystemTrayIcon, QMenu, QGridLayout, QScrollArea, QSizePolicy
+    QSystemTrayIcon, QMenu, QGridLayout, QScrollArea, QSizePolicy,
+    QTimeEdit
 )
 
-from stats_store import StatsStore, format_duration
+from stats_store import ReminderSettings, StatsStore, format_duration
 
 INTERVAL_MS = 30 * 60 * 1000
 DAILY_BREAK_GOAL = 8
@@ -526,6 +528,7 @@ class EyeRestApp(QMainWindow):
         super().__init__()
         _enable_windows_dpi_awareness()
         self.stats = StatsStore.load()
+        self.reminder_settings = self.stats.reminder_settings()
         self.setWindowTitle("瞳憩")
         self.resize(1360, 900)
         self.setMinimumSize(1180, 780)
@@ -533,7 +536,8 @@ class EyeRestApp(QMainWindow):
         self.setStyleSheet(MAIN_QSS)
         
         self.overlay_windows = []
-        self._next_break_at = time.monotonic() + INTERVAL_MS / 1000.0
+        self._remaining_break_sec = INTERVAL_MS / 1000.0
+        self._last_countdown_tick = time.monotonic()
         self._break_started_at = None
         self._current_trigger = "timer"
         
@@ -546,10 +550,6 @@ class EyeRestApp(QMainWindow):
         self.countdown_timer = QTimer(self)
         self.countdown_timer.timeout.connect(self._on_countdown_tick)
         self.countdown_timer.start(1000)
-        
-        self.break_timer = QTimer(self)
-        self.break_timer.timeout.connect(self._on_break_timer)
-        self.break_timer.start(INTERVAL_MS)
 
     def _setup_ui(self):
         central = QWidget()
@@ -635,6 +635,41 @@ class EyeRestApp(QMainWindow):
         self.timer_switch.clicked.connect(self._on_timer_toggled)
         row1.addWidget(self.timer_switch)
         cl1.addLayout(row1)
+
+        work_hours_row = QHBoxLayout()
+        work_hours_desc_layout = QVBoxLayout()
+        work_hours_desc_layout.setSpacing(4)
+
+        work_hours_title = QLabel("工作时间")
+        work_hours_title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        work_hours_desc = QLabel("仅在这个时间段内触发自动提醒，手动开始休息不受影响")
+        work_hours_desc.setStyleSheet("color: #777; font-size: 13px; font-weight: normal;")
+
+        work_hours_desc_layout.addWidget(work_hours_title)
+        work_hours_desc_layout.addWidget(work_hours_desc)
+
+        work_hours_row.addLayout(work_hours_desc_layout)
+        work_hours_row.addStretch()
+
+        self.work_start_edit = QTimeEdit()
+        self.work_start_edit.setDisplayFormat("HH:mm")
+        self.work_start_edit.setTime(self._qtime_from_minutes(self.reminder_settings.workday_start_minutes))
+        self.work_start_edit.timeChanged.connect(self._on_work_hours_changed)
+        self.work_start_edit.setFixedWidth(90)
+
+        separator = QLabel("至")
+        separator.setStyleSheet("color: #666; font-size: 13px; font-weight: 600;")
+
+        self.work_end_edit = QTimeEdit()
+        self.work_end_edit.setDisplayFormat("HH:mm")
+        self.work_end_edit.setTime(self._qtime_from_minutes(self.reminder_settings.workday_end_minutes))
+        self.work_end_edit.timeChanged.connect(self._on_work_hours_changed)
+        self.work_end_edit.setFixedWidth(90)
+
+        work_hours_row.addWidget(self.work_start_edit)
+        work_hours_row.addWidget(separator)
+        work_hours_row.addWidget(self.work_end_edit)
+        cl1.addLayout(work_hours_row)
         
         # Divider Line
         line = QFrame()
@@ -968,36 +1003,76 @@ class EyeRestApp(QMainWindow):
 
     def _on_timer_toggled(self):
         self.timer_enabled = self.timer_switch.isChecked()
+        self._last_countdown_tick = time.monotonic()
         if self.timer_enabled:
-            self._next_break_at = time.monotonic() + INTERVAL_MS / 1000.0
-            self.break_timer.start(INTERVAL_MS)
+            self._remaining_break_sec = INTERVAL_MS / 1000.0
             self.countdown_subtitle.setText("距离下次护眼休息")
             self.countdown_label.setStyleSheet("font-size: 72px; font-weight: 900; color: #0078D4; font-family: 'Arial', sans-serif; letter-spacing: 4px;")
             self._refresh_countdown_text()
         else:
-            self.break_timer.stop()
             self.countdown_label.setText("未开启")
             self.countdown_subtitle.setText("定时提醒已在上方暂停")
             self.countdown_label.setStyleSheet("font-size: 72px; font-weight: 900; color: #C0C0C0; font-family: 'Arial', sans-serif; letter-spacing: 4px;")
             self.tray_countdown_action.setText("定时提醒已暂停")
             self.tray_icon.setToolTip("瞳憩 - 已暂停")
 
+    def _on_work_hours_changed(self):
+        settings = ReminderSettings(
+            workday_start_minutes=self._minutes_from_qtime(self.work_start_edit.time()),
+            workday_end_minutes=self._minutes_from_qtime(self.work_end_edit.time()),
+        )
+        self.reminder_settings = self.stats.update_reminder_settings(settings)
+        self._last_countdown_tick = time.monotonic()
+        self._refresh_countdown_text()
+
     def _on_countdown_tick(self):
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._last_countdown_tick)
+        self._last_countdown_tick = now
         if self.overlay_windows:
             return
-        if self.timer_enabled:
-            self._refresh_countdown_text()
+        if not self.timer_enabled:
+            return
+        if self._is_within_work_hours():
+            self._remaining_break_sec = max(0.0, self._remaining_break_sec - elapsed)
+            if self._remaining_break_sec <= 0:
+                self._open_overlays(trigger="timer")
+                return
+        self._refresh_countdown_text()
 
     def _refresh_countdown_text(self):
         if not self.timer_enabled:
             return
-        left = int(max(0, self._next_break_at - time.monotonic()))
+        if not self._is_within_work_hours():
+            next_start = self.reminder_settings.workday_start
+            self.countdown_label.setText("已暂停")
+            self.countdown_subtitle.setText(f"当前非工作时间，将于 {next_start} 恢复提醒")
+            self.countdown_label.setStyleSheet("font-size: 72px; font-weight: 900; color: #C0C0C0; font-family: 'Arial', sans-serif; letter-spacing: 2px;")
+            self.tray_countdown_action.setText(f"非工作时间，{next_start} 恢复提醒")
+            self.tray_icon.setToolTip("瞳憩 - 非工作时间暂停")
+            return
+
+        left = int(max(0, ceil(self._remaining_break_sec)))
         m, s = divmod(left, 60)
         time_str = f"{m:02d}:{s:02d}"
         
         self.countdown_label.setText(time_str)
+        self.countdown_label.setStyleSheet("font-size: 72px; font-weight: 900; color: #0078D4; font-family: 'Arial', sans-serif; letter-spacing: 4px;")
+        self.countdown_subtitle.setText(
+            f"距离下次护眼休息 · 工作时间 {self.reminder_settings.workday_start}-{self.reminder_settings.workday_end}"
+        )
         self.tray_countdown_action.setText(f"下次休息还有：{time_str}")
         self.tray_icon.setToolTip(f"瞳憩 - 倒计时 {time_str}")
+
+    def _is_within_work_hours(self) -> bool:
+        return self.reminder_settings.contains()
+
+    def _minutes_from_qtime(self, value: QTime) -> int:
+        return value.hour() * 60 + value.minute()
+
+    def _qtime_from_minutes(self, total_minutes: int) -> QTime:
+        hour, minute = divmod(total_minutes % (24 * 60), 60)
+        return QTime(hour, minute)
 
     def _refresh_stats(self):
         self.stats.reload()
@@ -1069,15 +1144,7 @@ class EyeRestApp(QMainWindow):
     def start_break(self):
         if self.overlay_windows:
             return
-        if self.timer_enabled:
-            self.break_timer.stop()
         self._open_overlays(trigger="manual")
-
-    def _on_break_timer(self):
-        if not self.timer_enabled:
-            return
-        self.break_timer.stop()
-        self._open_overlays(trigger="timer")
 
     def _open_overlays(self, trigger: str):
         if self.overlay_windows:
@@ -1114,8 +1181,8 @@ class EyeRestApp(QMainWindow):
             self._refresh_stats()
             
         if self.timer_enabled:
-            self._next_break_at = time.monotonic() + INTERVAL_MS / 1000.0
-            self.break_timer.start(INTERVAL_MS)
+            self._remaining_break_sec = INTERVAL_MS / 1000.0
+            self._last_countdown_tick = time.monotonic()
             self._refresh_countdown_text()
 
     def _on_tray_activated(self, reason):
