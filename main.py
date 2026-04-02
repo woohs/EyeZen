@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 import ctypes
 from math import ceil
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal, QSize, QRect, QRectF, QPointF, QTime
 from PySide6.QtGui import (
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
     QTimeEdit
 )
 
+from startup_manager import StartupManager, build_startup_command
 from stats_store import ReminderSettings, StatsStore, format_duration
 
 INTERVAL_MS = 30 * 60 * 1000
@@ -529,6 +532,7 @@ class EyeRestApp(QMainWindow):
         _enable_windows_dpi_awareness()
         self.stats = StatsStore.load()
         self.reminder_settings = self.stats.reminder_settings()
+        self.startup_manager = StartupManager(app_name="EyeZen")
         self.setWindowTitle("瞳憩")
         self.resize(1360, 900)
         self.setMinimumSize(1180, 780)
@@ -546,6 +550,7 @@ class EyeRestApp(QMainWindow):
         # 必须先初始化系统托盘以挂载相关 Action
         self._setup_tray()
         self._setup_ui()
+        self._sync_startup_setting()
         
         self.countdown_timer = QTimer(self)
         self.countdown_timer.timeout.connect(self._on_countdown_tick)
@@ -635,6 +640,31 @@ class EyeRestApp(QMainWindow):
         self.timer_switch.clicked.connect(self._on_timer_toggled)
         row1.addWidget(self.timer_switch)
         cl1.addLayout(row1)
+
+        startup_row = QHBoxLayout()
+        startup_desc_layout = QVBoxLayout()
+        startup_desc_layout.setSpacing(4)
+
+        startup_title = QLabel("开机自动启动")
+        startup_title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        startup_desc = QLabel("登录 Windows 后自动启动，默认仅驻留托盘")
+        startup_desc.setStyleSheet("color: #777; font-size: 13px; font-weight: normal;")
+
+        startup_desc_layout.addWidget(startup_title)
+        startup_desc_layout.addWidget(startup_desc)
+
+        startup_row.addLayout(startup_desc_layout)
+        startup_row.addStretch()
+
+        self.startup_switch = ToggleSwitch()
+        self.startup_switch.setChecked(self.reminder_settings.launch_at_startup)
+        self.startup_switch.clicked.connect(self._on_startup_toggled)
+        startup_row.addWidget(self.startup_switch)
+        cl1.addLayout(startup_row)
+
+        if not self.startup_manager.is_supported():
+            startup_desc.setText("当前系统暂不支持此功能")
+            self.startup_switch.setEnabled(False)
 
         work_hours_row = QHBoxLayout()
         work_hours_desc_layout = QVBoxLayout()
@@ -1020,10 +1050,19 @@ class EyeRestApp(QMainWindow):
         settings = ReminderSettings(
             workday_start_minutes=self._minutes_from_qtime(self.work_start_edit.time()),
             workday_end_minutes=self._minutes_from_qtime(self.work_end_edit.time()),
+            launch_at_startup=self.reminder_settings.launch_at_startup,
         )
         self.reminder_settings = self.stats.update_reminder_settings(settings)
         self._last_countdown_tick = time.monotonic()
         self._refresh_countdown_text()
+
+    def _on_startup_toggled(self):
+        enabled = self.startup_switch.isChecked()
+        if self._apply_startup_setting(enabled):
+            return
+        self.startup_switch.blockSignals(True)
+        self.startup_switch.setChecked(self.reminder_settings.launch_at_startup)
+        self.startup_switch.blockSignals(False)
 
     def _on_countdown_tick(self):
         now = time.monotonic()
@@ -1066,6 +1105,29 @@ class EyeRestApp(QMainWindow):
 
     def _is_within_work_hours(self) -> bool:
         return self.reminder_settings.contains()
+
+    def _sync_startup_setting(self) -> None:
+        if not self.startup_manager.is_supported():
+            return
+        self._apply_startup_setting(self.reminder_settings.launch_at_startup, persist=False)
+
+    def _apply_startup_setting(self, enabled: bool, persist: bool = True) -> bool:
+        command = self._startup_command()
+        if not self.startup_manager.set_enabled(command, enabled):
+            return False
+        if persist:
+            self.reminder_settings = self.stats.update_reminder_settings(
+                ReminderSettings(
+                    workday_start_minutes=self.reminder_settings.workday_start_minutes,
+                    workday_end_minutes=self.reminder_settings.workday_end_minutes,
+                    launch_at_startup=enabled,
+                )
+            )
+        return True
+
+    def _startup_command(self) -> str:
+        launch_target = None if getattr(sys, "frozen", False) else Path(__file__).resolve()
+        return build_startup_command(sys.executable, launch_target)
 
     def _minutes_from_qtime(self, value: QTime) -> int:
         return value.hour() * 60 + value.minute()
@@ -1202,13 +1264,20 @@ class EyeRestApp(QMainWindow):
 
 
 def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--minimized", action="store_true")
+    args, _ = parser.parse_known_args()
+
     app = QApplication(sys.argv)
     
     # 保证只运行一个实例、提升在高分屏下的表现等
     app.setQuitOnLastWindowClosed(False)
     
     window = EyeRestApp()
-    window.show()
+    if args.minimized:
+        window.hide()
+    else:
+        window.show()
     
     sys.exit(app.exec())
 

@@ -68,10 +68,25 @@ def _parse_clock_minutes(value: Any, fallback: int) -> int:
     return fallback
 
 
+def _parse_bool(value: Any, fallback: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return fallback
+
+
 @dataclass(frozen=True)
 class ReminderSettings:
     workday_start_minutes: int = DEFAULT_WORKDAY_START_MINUTES
     workday_end_minutes: int = DEFAULT_WORKDAY_END_MINUTES
+    launch_at_startup: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> ReminderSettings:
@@ -85,6 +100,7 @@ class ReminderSettings:
                 payload.get("workday_end"),
                 DEFAULT_WORKDAY_END_MINUTES,
             ),
+            launch_at_startup=_parse_bool(payload.get("launch_at_startup"), True),
         )
 
     @property
@@ -99,6 +115,7 @@ class ReminderSettings:
         return {
             "workday_start": self.workday_start,
             "workday_end": self.workday_end,
+            "launch_at_startup": self.launch_at_startup,
         }
 
     def contains(self, current_time: datetime | dt_time | None = None) -> bool:

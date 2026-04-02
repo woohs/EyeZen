@@ -55,14 +55,19 @@ class StatsStoreTests(unittest.TestCase):
 
         self.assertEqual(settings.workday_start, "09:00")
         self.assertEqual(settings.workday_end, "18:00")
+        self.assertTrue(settings.launch_at_startup)
         self.assertEqual(
             self.store.data["reminder_settings"],
-            {"workday_start": "09:00", "workday_end": "18:00"},
+            {
+                "workday_start": "09:00",
+                "workday_end": "18:00",
+                "launch_at_startup": True,
+            },
         )
 
     def test_update_reminder_settings_is_persisted(self):
         settings = ReminderSettings.from_dict(
-            {"workday_start": "08:30", "workday_end": "17:45"}
+            {"workday_start": "08:30", "workday_end": "17:45", "launch_at_startup": True}
         )
 
         self.store.update_reminder_settings(settings)
@@ -72,6 +77,20 @@ class StatsStoreTests(unittest.TestCase):
         saved = reloaded.reminder_settings()
         self.assertEqual(saved.workday_start, "08:30")
         self.assertEqual(saved.workday_end, "17:45")
+        self.assertTrue(saved.launch_at_startup)
+
+    def test_default_reminder_settings_enable_launch_at_startup(self):
+        settings = self.store.reminder_settings()
+
+        self.assertTrue(settings.launch_at_startup)
+        self.assertEqual(
+            self.store.data["reminder_settings"],
+            {
+                "workday_start": "09:00",
+                "workday_end": "18:00",
+                "launch_at_startup": True,
+            },
+        )
 
     def test_reminder_settings_contains_only_work_hours(self):
         settings = ReminderSettings.from_dict(
